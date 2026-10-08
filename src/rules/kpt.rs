@@ -550,6 +550,16 @@ impl Rule for KptRule {
                         A standalone file uses plain `[[rules]]` tables.",
                 },
                 DocSection {
+                    title: "Selecting patterns",
+                    body: "`select` matches pattern IDs, not the KPT category. \
+                        `select = [\"KPT\"]` runs only patterns whose IDs start with `KPT`; \
+                        custom prefixes must be selected explicitly:\n\n\
+                        ```toml\n\
+                        [tool.konform.lint]\n\
+                        select = [\"KPT\", \"CTF\"]\n\
+                        ```",
+                },
+                DocSection {
                     title: "Pattern entry fields",
                     body: "| Field | Required | Description |\n\
                         | --- | --- | --- |\n\

@@ -46,6 +46,15 @@ Patterns are loaded from the first available source:
 
 A standalone file uses plain `[[rules]]` tables.
 
+## Selecting patterns
+
+`select` matches pattern IDs, not the KPT category. `select = ["KPT"]` runs only patterns whose IDs start with `KPT`; custom prefixes must be selected explicitly:
+
+```toml
+[tool.konform.lint]
+select = ["KPT", "CTF"]
+```
+
 ## Pattern entry fields
 
 | Field | Required | Description |
