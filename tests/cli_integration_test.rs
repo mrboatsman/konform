@@ -3,6 +3,83 @@ use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 
 #[test]
+fn native_import_boundaries_are_configured_selected_and_reported_by_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("modules/company/lib")).unwrap();
+    std::fs::create_dir_all(dir.path().join("modules/company/specs/audio")).unwrap();
+    std::fs::write(
+        dir.path().join("modules/company/specs/audio/helpers.py"),
+        "",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("modules/company/lib/controller.py"),
+        "from ..specs.audio import (\n helpers, # comment\n)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[tool.konform]\nsrc=['modules']\n\
+         [tool.konform.lint]\nselect=['KIB001']\n\
+         [tool.konform.lint.import-boundaries]\n\
+         source-roots=['modules']\nlevel='error'\n\
+         forbidden=[{from='company.lib',to='company.specs'}]\n",
+    )
+    .unwrap();
+    Command::cargo_bin("konform")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["check", "--no-cache", "--output-format", "json", "modules"])
+        .assert()
+        .failure()
+        .stdout(contains("KIB001"))
+        .stdout(contains("company.specs.audio"));
+    Command::cargo_bin("konform")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["check", "--select", "KIB002", "--no-cache", "modules"])
+        .assert()
+        .failure()
+        .stderr(contains("KIB002"));
+}
+
+#[test]
+fn automatic_sibling_boundaries_need_no_rule_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    for module in [
+        "src/product/func1/hello_world.py",
+        "src/product/func2/controller.py",
+        "src/shared/hello_world.py",
+    ] {
+        let path = dir.path().join(module);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[tool.konform.lint]\nselect=['KIB002']\n",
+    )
+    .unwrap();
+    let file = dir.path().join("src/product/func2/controller.py");
+    std::fs::write(&file, "import product.func1.hello_world\n").unwrap();
+    Command::cargo_bin("konform")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["check", "--no-cache", "--level", "warning", "src"])
+        .assert()
+        .failure()
+        .stderr(contains("KIB002"))
+        .stderr(contains("product.func1.hello_world"));
+    std::fs::write(file, "import shared.hello_world\n").unwrap();
+    Command::cargo_bin("konform")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["check", "--no-cache", "--level", "warning", "src"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn test_help_exits_zero() {
     let mut cmd = Command::cargo_bin("konform").unwrap();
     cmd.arg("--help").assert().success();

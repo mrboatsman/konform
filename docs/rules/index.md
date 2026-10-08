@@ -12,6 +12,8 @@ konform supports an increasing list of opinionated rules not supported by Ruff. 
 
 | Code | Rule | Linter | Status |
 | ---- | ---- | ------ | ------ |
+| `KIB001` | [`import-boundaries`](kib001.md)<br>Checks direct imports crossing configured forbidden module boundaries. | KIB (KIB) | ✅ |
+| `KIB002` | [`import-boundaries`](kib002.md)<br>Checks direct imports between local nested sibling packages, with optional parent scopes. | KIB (KIB) | ✅ |
 | `KIS001` | [`module-only-imports`](kis001.md)<br>Checks that `from X import Y` imports only sub-modules, not objects. | Import style (KIS) | ✅ 🛠️ |
 | `KIS002` | [`import-alias-policy`](kis002.md)<br>Checks that `from X import Y as Z` only renames when needed to avoid a collision. | Import style (KIS) | ✅ 🛠️ ⚠️ |
 | `KNQ001` | [`noqa-justification`](knq001.md)<br>Requires a reason on every `# noqa` suppression comment. | noqa comments (KNQ) |  |

@@ -22,6 +22,9 @@ use ruff_text_size::Ranged;
 // Sub-modules
 // ---------------------------------------------------------------------------
 pub mod docs;
+mod import_boundaries;
+pub mod kib001;
+pub mod kib002;
 pub mod kis001;
 pub mod kis002;
 pub mod knq001;
@@ -665,13 +668,23 @@ pub fn all_rules(
     config_dir: Option<std::path::PathBuf>,
 ) -> Vec<Box<dyn Rule>> {
     vec![
-        Box::new(kis001::Kis001Rule::new(probe)),
+        Box::new(kis001::Kis001Rule::new(Arc::clone(&probe))),
         Box::new(kis002::Kis002Rule::new()),
-        Box::new(knq001::Knq001Rule::new()),
+        Box::new(kib001::Kib001Rule::new(
+            Arc::clone(&probe),
+            config_dir.clone(),
+        )),
+        Box::new(kib002::Kib002Rule::new(
+            Arc::clone(&probe),
+            config_dir.clone(),
+        )),
         Box::new(knq002::Knq002Rule::new()),
         Box::new(knq003::Knq003Rule::new()),
         Box::new(kpt::KptRule::new(config_dir.clone())),
         Box::new(kst::KstRule::new(config_dir)),
+        // Must stay last: it audits the `# noqa` suppressions the rules
+        // above recorded on the shared `FileContext`.
+        Box::new(knq001::Knq001Rule::new()),
     ]
 }
 
@@ -804,6 +817,31 @@ mod noqa_matching_tests {
         assert_eq!(parse_noqa("# noqa").unwrap().codes, None);
         assert_eq!(parse_noqa("# noqa:").unwrap().codes, None);
         assert!(parse_noqa("# just a comment").is_none());
+    }
+
+    #[test]
+    fn reason_text_does_not_change_selected_noqa_codes() {
+        assert!(has_noqa(
+            "import feature  # noqa: KIB002 -- Reason: real integration dependency",
+            "KIB002",
+            &none()
+        ));
+        assert!(!has_noqa(
+            "import feature  # noqa: KIB002 -- Reason: KIS001 must still run",
+            "KIS001",
+            &none()
+        ));
+        assert!(has_noqa(
+            "import feature  # noqa: KIB002, KIS001 -- Reason: integration",
+            "KIS001",
+            &none()
+        ));
+        let aliases = HashMap::from([("OLD".into(), "KIB002".into())]);
+        assert!(has_noqa(
+            "import feature  # noqa: OLD -- Reason: integration",
+            "KIB002",
+            &aliases
+        ));
     }
 
     fn noqa_lines(src: &str) -> Vec<String> {

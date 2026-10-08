@@ -4,6 +4,11 @@
 
 konform enables the following rules by default (when no `select` is configured). See [Configuration](../configuration.md) to change that.
 
+## KIB (KIB)
+
+- [`import-boundaries`](kib001.md) (`KIB001`)
+- [`import-boundaries`](kib002.md) (`KIB002`)
+
 ## Import style (KIS)
 
 - [`module-only-imports`](kis001.md) (`KIS001`)
