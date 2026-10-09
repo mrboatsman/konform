@@ -12,6 +12,7 @@ konform supports an increasing list of opinionated rules not supported by Ruff. 
 
 | Code | Rule | Linter | Status |
 | ---- | ---- | ------ | ------ |
+| `KDU001` | [`duplicated-constants`](kdu001.md)<br>Flags constants and containers whose value is also defined in another module. | KDU (KDU) | ✅ |
 | `KIB001` | [`import-boundaries`](kib001.md)<br>Checks direct imports crossing configured forbidden module boundaries. | KIB (KIB) | ✅ |
 | `KIB002` | [`import-boundaries`](kib002.md)<br>Checks direct imports between local nested sibling packages, with optional parent scopes. | KIB (KIB) | ✅ |
 | `KIS001` | [`module-only-imports`](kis001.md)<br>Checks that `from X import Y` imports only sub-modules, not objects. | Import style (KIS) | ✅ 🛠️ |

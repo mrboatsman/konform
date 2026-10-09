@@ -17,6 +17,7 @@
 //! Each cache file is a [`bincode`]-encoded [`PackageCache`] struct.
 
 use crate::config::Config;
+use crate::rules::project::Fact;
 use crate::rules::Rule;
 use anyhow::Result;
 use bincode::{Decode, Encode};
@@ -33,6 +34,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Entries not visited within this many days are evicted on [`Cache::persist`].
 const EVICT_DAYS: u64 = 30;
+
+/// Version of the on-disk layout, folded into the cache file name. Bump it
+/// whenever [`PackageCache`] changes shape: bincode has no field names, so an
+/// old file could otherwise decode into wrong data instead of failing.
+const CACHE_FORMAT: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // On-disk data structures
@@ -57,6 +63,8 @@ struct FileCache {
     /// Violations found on the last check.  An empty `Vec` means "checked
     /// and clean".  Absence from the map means "not yet cached".
     violations: Vec<CachedViolation>,
+    /// Facts collected by project rules (see [`crate::rules::project`]).
+    facts: Vec<Fact>,
 }
 
 /// Slim violation record stored in the cache.
@@ -235,6 +243,7 @@ fn settings_hash(
     rules_fingerprint: u64,
 ) -> u64 {
     let mut h = SeaHasher::new();
+    CACHE_FORMAT.hash(&mut h);
     for component in package_root.components() {
         format!("{component:?}").hash(&mut h);
     }
@@ -295,7 +304,7 @@ pub struct Cache {
     no_cache: bool,
     package: PackageCache,
     /// Pending updates applied to disk in [`Cache::persist`].
-    pending: Vec<(String, u64, Vec<CachedViolation>)>,
+    pending: Vec<(String, u64, Vec<CachedViolation>, Vec<Fact>)>,
 }
 
 impl Cache {
@@ -390,26 +399,47 @@ impl Cache {
         Some(entry.violations.iter().map(|v| v.to_json()).collect())
     }
 
+    /// Look up the cached project-rule facts of a file, like [`Cache::get`].
+    pub fn get_facts(&self, abs_path: &Path, key: &FileCacheKey) -> Option<Vec<Fact>> {
+        if self.no_cache {
+            return None;
+        }
+        let entry = self.package.files.get(&Self::path_key(abs_path))?;
+        (entry.key == key.hash()).then(|| entry.facts.clone())
+    }
+
     /// Stage a linted result.  Applied to disk in [`Cache::persist`].
+    #[cfg(test)]
     pub fn set_linted(
         &mut self,
         abs_path: &Path,
         key: &FileCacheKey,
         json_viols: &[serde_json::Value],
     ) {
+        self.set_linted_with_facts(abs_path, key, json_viols, vec![]);
+    }
+
+    /// Stage a linted result together with its project-rule facts.
+    pub fn set_linted_with_facts(
+        &mut self,
+        abs_path: &Path,
+        key: &FileCacheKey,
+        json_viols: &[serde_json::Value],
+        facts: Vec<Fact>,
+    ) {
         let violations: Vec<CachedViolation> = json_viols
             .iter()
             .filter_map(CachedViolation::from_json)
             .collect();
         self.pending
-            .push((Self::path_key(abs_path), key.hash(), violations));
+            .push((Self::path_key(abs_path), key.hash(), violations, facts));
     }
 
     /// Remove `abs_path` from the cache (called after an in-place fix).
     pub fn invalidate(&mut self, abs_path: &Path) {
         let k = Self::path_key(abs_path);
         self.package.files.remove(&k);
-        self.pending.retain(|(r, _, _)| r != &k);
+        self.pending.retain(|(r, ..)| r != &k);
     }
 
     /// Merge pending entries, evict stale ones, and write atomically.
@@ -423,13 +453,14 @@ impl Cache {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        for (k, key_hash, violations) in std::mem::take(&mut self.pending) {
+        for (k, key_hash, violations, facts) in std::mem::take(&mut self.pending) {
             self.package.files.insert(
                 k,
                 FileCache {
                     key: key_hash,
                     last_seen: now_ms,
                     violations,
+                    facts,
                 },
             );
         }
@@ -621,6 +652,33 @@ mod tests {
     }
 
     #[test]
+    fn facts_round_trip_through_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.py");
+        std::fs::write(&file, "X = 1\n").unwrap();
+        let fact = Fact {
+            rule: "KDU001".into(),
+            key: "name X 1".into(),
+            name: "X".into(),
+            display: "1".into(),
+            line: 1,
+            col: 0,
+            end_line: 1,
+            end_col: 1,
+        };
+        {
+            let mut c = open_cache(tmp.path(), &[], &[]);
+            let key = FileCacheKey::from_path(&file).unwrap();
+            c.set_linted_with_facts(&file, &key, &[], vec![fact.clone()]);
+            c.persist().unwrap();
+        }
+        let c2 = open_cache(tmp.path(), &[], &[]);
+        let key = FileCacheKey::from_path(&file).unwrap();
+        assert_eq!(c2.get_facts(&file, &key), Some(vec![fact]));
+        assert_eq!(c2.get(&file, &key).map(|v| v.len()), Some(0));
+    }
+
+    #[test]
     fn cache_miss_after_mtime_change() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("e.py");
@@ -734,6 +792,7 @@ mod tests {
                     key: 0,
                     last_seen: old_ms,
                     violations: vec![],
+                    facts: vec![],
                 },
             );
             let bytes = bincode::encode_to_vec(&pkg, bincode::config::standard()).unwrap();

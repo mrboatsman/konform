@@ -17,12 +17,14 @@
 //! ```
 
 use crate::config::Config;
+use crate::rules::project::{Fact, FactRef};
 use crate::rules::{FileContext, FixTarget, NoqaAudit, Rule};
 use crate::types::Violation;
 use anyhow::Result;
 use globset::{Glob, GlobMatcher};
 use ruff_python_parser::parse_module;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -79,6 +81,53 @@ pub fn run_check(
     rules: &[Box<dyn Rule>],
     config: &Config,
 ) -> Vec<Violation> {
+    run_check_file(input, rules, config).violations
+}
+
+#[derive(Debug, Default)]
+pub struct FileResult {
+    pub violations: Vec<Violation>,
+    pub facts: Vec<Fact>,
+}
+
+pub fn run_check_file(
+    input: &CheckInput<'_>,
+    rules: &[Box<dyn Rule>],
+    config: &Config,
+) -> FileResult {
+    let ctx = file_context(input, rules, config);
+    let ignores = PerFileIgnores::new(config);
+    let mut result = FileResult::default();
+    for rule in active_rules(rules, config) {
+        let rule_config = config.rule_config(rule.config_name());
+        result.violations.extend(rule.check(&ctx, rule_config));
+        if let Some(project) = rule.project() {
+            if !ignores.matches(input.path, rule.code()) {
+                result.facts.extend(project.collect(&ctx, rule_config));
+            }
+        }
+    }
+    result
+        .violations
+        .retain(|violation| !ignores.matches(input.path, &violation.rule));
+    let fix_selection = config.fix_selection();
+    for violation in &mut result.violations {
+        violation.fixable &= fix_selection.is_enabled(&violation.rule);
+    }
+    result
+}
+
+pub fn run_collect(input: &CheckInput<'_>, rules: &[Box<dyn Rule>], config: &Config) -> Vec<Fact> {
+    let ctx = file_context(input, rules, config);
+    let ignores = PerFileIgnores::new(config);
+    active_rules(rules, config)
+        .filter(|rule| !ignores.matches(input.path, rule.code()))
+        .filter_map(|rule| Some((rule.project()?, rule.config_name())))
+        .flat_map(|(project, name)| project.collect(&ctx, config.rule_config(name)))
+        .collect()
+}
+
+fn file_context(input: &CheckInput<'_>, rules: &[Box<dyn Rule>], config: &Config) -> FileContext {
     let mut ctx = FileContext::from(input);
     // Config flag takes precedence over CheckInput flag.
     if config.ignore_noqa {
@@ -90,16 +139,87 @@ pub fn run_check(
     if active.iter().any(|r| r.audits_noqa()) {
         ctx.noqa_audit = Some(Arc::new(noqa_audit(&ctx, rules, config)));
     }
-    let mut violations: Vec<Violation> = active
-        .iter()
-        .flat_map(|r| r.check(&ctx, config.rule_config(r.config_name())))
-        .collect();
-    apply_per_file_ignores(input.path, &mut violations, config);
-    let fix_selection = config.fix_selection();
-    for v in &mut violations {
-        v.fixable &= fix_selection.is_enabled(&v.rule);
+    ctx
+}
+
+#[derive(Debug, Default)]
+pub struct ProjectFacts {
+    files: BTreeMap<PathBuf, ProjectFile>,
+}
+
+#[derive(Debug)]
+struct ProjectFile {
+    display: PathBuf,
+    facts: Vec<Fact>,
+    reported: bool,
+}
+
+impl ProjectFacts {
+    pub fn insert(&mut self, path: &Path, facts: Vec<Fact>) {
+        let key = canonical_path(path);
+        let display = self
+            .files
+            .remove(&key)
+            .map_or_else(|| path.to_path_buf(), |file| file.display);
+        self.files.insert(
+            key,
+            ProjectFile {
+                display,
+                facts,
+                reported: true,
+            },
+        );
     }
-    violations
+
+    pub fn insert_context(&mut self, path: &Path, facts: Vec<Fact>) {
+        self.files
+            .entry(canonical_path(path))
+            .or_insert_with(|| ProjectFile {
+                display: path.to_path_buf(),
+                facts,
+                reported: false,
+            });
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        self.files.contains_key(&canonical_path(path))
+    }
+
+    pub fn finish(&self, rules: &[Box<dyn Rule>], config: &Config) -> Vec<(PathBuf, Violation)> {
+        let mut out = vec![];
+        for rule in active_rules(rules, config) {
+            let Some(project) = rule.project() else {
+                continue;
+            };
+            let mut owners = vec![];
+            let mut refs = vec![];
+            for file in self.files.values() {
+                for fact in file.facts.iter().filter(|fact| fact.rule == rule.code()) {
+                    owners.push(file);
+                    refs.push(FactRef {
+                        path: &file.display,
+                        fact,
+                    });
+                }
+            }
+            for (index, violation) in project.finish(&refs, config.rule_config(rule.config_name()))
+            {
+                let owner = owners[index];
+                if owner.reported {
+                    out.push((owner.display.clone(), violation));
+                }
+            }
+        }
+        out
+    }
+}
+
+pub fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    })
 }
 
 /// The rules of `rules` that `config` turns on (rules emitting several codes
@@ -160,22 +280,43 @@ fn apply_per_file_ignores(path: &Path, violations: &mut Vec<Violation>, config: 
     if config.lint.per_file_ignores.is_empty() || violations.is_empty() {
         return;
     }
-    let matchers: Vec<(GlobMatcher, Vec<String>)> = config
-        .lint
-        .per_file_ignores
-        .iter()
-        .filter_map(|(pat, codes)| {
-            Glob::new(pat)
-                .ok()
-                .map(|g| (g.compile_matcher(), codes.clone()))
-        })
-        .collect();
-    if matchers.is_empty() {
-        return;
+    let ignores = PerFileIgnores::new(config);
+    violations.retain(|violation| !ignores.matches(path, &violation.rule));
+}
+
+struct PerFileIgnores {
+    matchers: Vec<(GlobMatcher, Vec<String>)>,
+    config_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+}
+
+impl PerFileIgnores {
+    fn new(config: &Config) -> Self {
+        Self {
+            matchers: config
+                .lint
+                .per_file_ignores
+                .iter()
+                .filter_map(|(pattern, codes)| {
+                    Glob::new(pattern)
+                        .ok()
+                        .map(|glob| (glob.compile_matcher(), codes.clone()))
+                })
+                .collect(),
+            config_dir: config.config_dir.clone(),
+            cwd: std::env::current_dir().ok(),
+        }
     }
-    let config_dir = config.config_dir.as_deref();
-    let cwd = std::env::current_dir().ok();
-    violations.retain(|v| !per_file_ignored(path, &v.rule, &matchers, config_dir, cwd.as_deref()));
+
+    fn matches(&self, path: &Path, rule: &str) -> bool {
+        per_file_ignored(
+            path,
+            rule,
+            &self.matchers,
+            self.config_dir.as_deref(),
+            self.cwd.as_deref(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

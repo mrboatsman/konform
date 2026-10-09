@@ -726,7 +726,7 @@ fn init_inserts_after_all_ruff_blocks() {
     assert!(pos("[tool.ruff.lint]") < pos("[tool.konform]"));
     assert!(pos("[tool.konform]") < pos("[tool.pytest.ini_options]"));
     assert!(
-        out.contains("quote-style = \"double\"\n\n[tool.ruff.lint]\nexternal = [\"KIS\", \"KPT\", \"KST\"]\n\n[tool.konform]\n"),
+        out.contains("quote-style = \"double\"\n\n[tool.ruff.lint]\nexternal = [\"KDU\", \"KIS\", \"KPT\", \"KST\"]\n\n[tool.konform]\n"),
         "{out}"
     );
     assert!(
@@ -801,7 +801,7 @@ fn init_patches_standalone_ruff_toml() {
     init_cmd(dir.path(), &["--no-patterns"]);
     assert_eq!(
         std::fs::read_to_string(&ruff).unwrap(),
-        "line-length = 100\n\n[lint]\nexternal = [\"KIS\", \"KPT\", \"KST\"]\n"
+        "line-length = 100\n\n[lint]\nexternal = [\"KDU\", \"KIS\", \"KPT\", \"KST\"]\n"
     );
     assert!(dir.path().join("konform.toml").is_file());
 }
@@ -1421,4 +1421,55 @@ fn rule_without_an_action_prints_usage() {
         .stderr(contains(
             "Use --list, --explain <CODE>, --test or --schema.",
         ));
+}
+
+fn kdu_project(paths: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        format!(
+            "[tool.konform.lint]\nselect = ['KDU']\n\
+                 [tool.konform.lint.duplicated-constants]\npaths = {paths}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("pkg")).unwrap();
+    std::fs::write(dir.path().join("pkg/a.py"), "URL = 'https://example.com'\n").unwrap();
+    std::fs::write(
+        dir.path().join("pkg/b.py"),
+        "CLOUD = \"https://example.com\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+fn kdu_check(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::cargo_bin("konform")
+        .unwrap()
+        .current_dir(dir)
+        .args([
+            "check",
+            "--cache-dir",
+            ".kcache",
+            "--output-format",
+            "concise",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn kdu001_finds_duplicates_across_files_and_on_partial_runs() {
+    let all = kdu_project("[]");
+    let output = kdu_check(all.path(), &["pkg"]);
+    assert!(output.contains("warning[KDU001]"), "{output}");
+    assert!(output.contains("pkg/a.py:1:1"), "{output}");
+    assert!(output.contains("pkg/b.py:1:1"), "{output}");
+
+    let partial = kdu_project("['pkg']");
+    let output = kdu_check(partial.path(), &["pkg/a.py"]);
+    assert!(output.contains("pkg/a.py:1:1: warning[KDU001]"), "{output}");
+    assert!(!output.contains("pkg/b.py:1:1"), "{output}");
 }

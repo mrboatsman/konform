@@ -28,8 +28,9 @@ use output::{
 };
 use owo_colors::OwoColorize;
 use rayon::prelude::*;
+use rules::project::Fact;
 use rules::{all_rules, merge_noqa, FileContext};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -589,12 +590,16 @@ Check `[tool.konform] python` (or your virtualenv) and try again.",
 
     // ── Check pass ────────────────────────────────────────────────────────
     let mut violations: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut project = engine::ProjectFacts::default();
     let mut uncached: Vec<&PathBuf> = Vec::new();
 
     for fp in &all_file_paths {
         let file_key = FileCacheKey::from_path(fp);
-        let cache_hit = file_key.as_ref().and_then(|k| cache.get(fp, k));
-        if let Some(cached) = cache_hit {
+        let cache_hit = file_key
+            .as_ref()
+            .and_then(|k| Some((cache.get(fp, k)?, cache.get_facts(fp, k)?)));
+        if let Some((cached, facts)) = cache_hit {
+            project.insert(fp, facts);
             if !cached.is_empty() {
                 violations.insert(fp.to_string_lossy().to_string(), cached);
             }
@@ -609,27 +614,26 @@ Check `[tool.konform] python` (or your virtualenv) and try again.",
             .build_global();
     }
 
-    let new_results: Vec<(PathBuf, Vec<serde_json::Value>)> = uncached
+    let new_results: Vec<(PathBuf, Vec<serde_json::Value>, Vec<Fact>)> = uncached
         .par_iter()
         .map(|fp| {
             let source = match std::fs::read_to_string(*fp) {
                 Ok(s) => s,
-                Err(_) => return ((*fp).clone(), vec![]),
+                Err(_) => return ((*fp).clone(), vec![], vec![]),
             };
             let mut input = CheckInput::new(fp, &source);
             input.ignore_noqa = config.ignore_noqa;
-            let json_viols = engine::run_check(&input, &active_rules, &config)
-                .into_iter()
-                .map(|v| v.to_json())
-                .collect();
-            ((*fp).clone(), json_viols)
+            let result = engine::run_check_file(&input, &active_rules, &config);
+            let json_viols = result.violations.into_iter().map(|v| v.to_json()).collect();
+            ((*fp).clone(), json_viols, result.facts)
         })
         .collect();
 
-    for (fp, results) in new_results {
+    for (fp, results, facts) in new_results {
         if let Some(key) = FileCacheKey::from_path(&fp) {
-            cache.set_linted(&fp, &key, &results);
+            cache.set_linted_with_facts(&fp, &key, &results, facts.clone());
         }
+        project.insert(&fp, facts);
         if !results.is_empty() {
             violations.insert(fp.to_string_lossy().to_string(), results);
         }
@@ -639,13 +643,23 @@ Check `[tool.konform] python` (or your virtualenv) and try again.",
     if let Some(ref src) = stdin_source {
         let mut input = CheckInput::new(&stdin_display, src);
         input.ignore_noqa = config.ignore_noqa;
-        let json_viols: Vec<serde_json::Value> = engine::run_check(&input, &active_rules, &config)
-            .into_iter()
-            .map(|v| v.to_json())
-            .collect();
+        let result = engine::run_check_file(&input, &active_rules, &config);
+        // Replaces the on-disk facts when --stdin-filename names a checked file.
+        project.insert(&stdin_display, result.facts);
+        let json_viols: Vec<serde_json::Value> =
+            result.violations.into_iter().map(|v| v.to_json()).collect();
         if !json_viols.is_empty() {
             violations.insert(stdin_display.to_string_lossy().into_owned(), json_viols);
         }
+    }
+
+    // Project rules: compare the facts of all files, report the run's files.
+    collect_context_facts(&mut project, &active_rules, &config, &cache);
+    for (path, violation) in project.finish(&active_rules, &config) {
+        violations
+            .entry(path.to_string_lossy().into_owned())
+            .or_default()
+            .push(violation.to_json());
     }
 
     let _ = cache.persist();
@@ -756,13 +770,64 @@ after a `\\` continuation); suppress it on another line or fix it",
             output_format: args.output_format,
             no_cache: args.no_cache || args.ignore_noqa,
         };
-        run_watch_loop(&args.common.file_paths, &ctx, cache);
+        run_watch_loop(&args.common.file_paths, &ctx, cache, project);
     }
 
     if args.exit_zero {
         std::process::exit(0);
     }
     std::process::exit(exit_code);
+}
+
+// ---------------------------------------------------------------------------
+// Project rules
+// ---------------------------------------------------------------------------
+
+/// Add the facts of the files under the enabled project rules' `paths` that
+/// are not part of the run, so a partial run still sees the other half of a
+/// cross-file finding. Facts come from the cache when possible.
+fn collect_context_facts(
+    project: &mut engine::ProjectFacts,
+    rules: &[Box<dyn rules::Rule>],
+    config: &config::Config,
+    cache: &Cache,
+) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let base = config.config_dir.clone().unwrap_or_else(|| cwd.clone());
+    let roots: BTreeSet<PathBuf> = rules
+        .iter()
+        .filter(|r| r.gates_per_violation() || config.runs_rule(r.code(), r.opt_in()))
+        .filter_map(|r| Some(r.project()?.paths(config.rule_config(r.config_name()))))
+        .flatten()
+        .map(|p| {
+            // Relative to cwd when possible, like the paths of the run.
+            let root = base.join(p);
+            match root.strip_prefix(&cwd) {
+                Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => root,
+            }
+        })
+        .collect();
+    let files: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|root| walk_python_files(root, config))
+        .filter(|f| !project.contains(f))
+        .collect();
+    let collected: Vec<(PathBuf, Vec<Fact>)> = files
+        .into_par_iter()
+        .map(|f| {
+            let cached = FileCacheKey::from_path(&f).and_then(|k| cache.get_facts(&f, &k));
+            let facts = cached.unwrap_or_else(|| match std::fs::read_to_string(&f) {
+                Ok(source) => engine::run_collect(&CheckInput::new(&f, &source), rules, config),
+                Err(_) => vec![],
+            });
+            (f, facts)
+        })
+        .collect();
+    for (f, facts) in collected {
+        project.insert_context(&f, facts);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +847,12 @@ struct RecheckContext<'a> {
 /// Enter the file-watching loop.  Called after the initial check pass when
 /// `-w` / `--watch` is set.  This function never returns; the process exits
 /// when Ctrl-C delivers SIGINT or the watcher backend disconnects.
-fn run_watch_loop(watch_paths: &[PathBuf], ctx: &RecheckContext<'_>, mut cache: Cache) -> ! {
+fn run_watch_loop(
+    watch_paths: &[PathBuf],
+    ctx: &RecheckContext<'_>,
+    mut cache: Cache,
+    mut project: engine::ProjectFacts,
+) -> ! {
     use notify::{Config as WatchConfig, RecommendedWatcher, RecursiveMode, Watcher};
     use std::collections::HashSet;
     use std::sync::mpsc;
@@ -834,7 +904,7 @@ fn run_watch_loop(watch_paths: &[PathBuf], ctx: &RecheckContext<'_>, mut cache: 
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
                     let batch: Vec<PathBuf> = pending.drain().collect();
-                    recheck_batch(&batch, ctx, &mut cache);
+                    recheck_batch(&batch, ctx, &mut cache, &mut project);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -858,7 +928,15 @@ fn is_watched_file(
 }
 
 /// Re-check a batch of changed files and print incremental output to stderr.
-fn recheck_batch(files: &[PathBuf], ctx: &RecheckContext<'_>, cache: &mut Cache) {
+///
+/// Project rules are re-run over all known facts, but, like every other
+/// rule, only findings in the changed files are printed.
+fn recheck_batch(
+    files: &[PathBuf],
+    ctx: &RecheckContext<'_>,
+    cache: &mut Cache,
+    project: &mut engine::ProjectFacts,
+) {
     let n = files.len();
     let s = if n == 1 { "" } else { "s" };
     eprintln!("\n\u{2500}\u{2500}\u{2500} {n} file{s} changed, rechecking \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
@@ -877,19 +955,31 @@ fn recheck_batch(files: &[PathBuf], ctx: &RecheckContext<'_>, cache: &mut Cache)
         };
         let mut input = CheckInput::new(file_path, &source);
         input.ignore_noqa = ctx.config.ignore_noqa;
+        let result = engine::run_check_file(&input, ctx.active_rules, ctx.config);
         let json_viols: Vec<serde_json::Value> =
-            engine::run_check(&input, ctx.active_rules, ctx.config)
-                .into_iter()
-                .map(|v| v.to_json())
-                .collect();
+            result.violations.into_iter().map(|v| v.to_json()).collect();
 
         if !ctx.no_cache {
             if let Some(key) = FileCacheKey::from_path(file_path) {
-                cache.set_linted(file_path, &key, &json_viols);
+                cache.set_linted_with_facts(file_path, &key, &json_viols, result.facts.clone());
             }
         }
+        project.insert(file_path, result.facts);
         if !json_viols.is_empty() {
             violations.insert(file_path.to_string_lossy().to_string(), json_viols);
+        }
+    }
+
+    let changed: HashMap<PathBuf, String> = files
+        .iter()
+        .map(|f| (engine::canonical_path(f), f.to_string_lossy().into_owned()))
+        .collect();
+    for (path, violation) in project.finish(ctx.active_rules, ctx.config) {
+        if let Some(key) = changed.get(&engine::canonical_path(&path)) {
+            violations
+                .entry(key.clone())
+                .or_default()
+                .push(violation.to_json());
         }
     }
 
@@ -1136,7 +1226,7 @@ fn run_version() {
 // ---------------------------------------------------------------------------
 
 /// Rule category prefixes registered with external linters (e.g. ruff `external`).
-const RULE_CATEGORIES: &[&str] = &["KIS", "KPT", "KST"];
+const RULE_CATEGORIES: &[&str] = &["KDU", "KIS", "KPT", "KST"];
 
 /// Default content written to a new `konform.toml`.
 /// Only non-default settings are included; everything else is left as a comment.
@@ -1388,7 +1478,7 @@ fn init_ruff_compat(dir: &std::path::Path, dry_run: bool) {
     // No ruff config found: nothing to do.
 }
 
-/// Attempt to add `external = ["KIS", "KPT", "KST"]` to a ruff config file.
+/// Attempt to add `external = [<RULE_CATEGORIES>]` to a ruff config file.
 ///
 /// Strategy:
 /// * If `external` is already present → skip (already configured).

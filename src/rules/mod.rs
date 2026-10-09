@@ -23,6 +23,7 @@ use ruff_text_size::Ranged;
 // ---------------------------------------------------------------------------
 pub mod docs;
 mod import_boundaries;
+pub mod kdu001;
 pub mod kib001;
 pub mod kib002;
 pub mod kis001;
@@ -32,6 +33,7 @@ pub mod knq002;
 pub mod knq003;
 pub mod kpt;
 pub mod kst;
+pub mod project;
 mod scope;
 
 // ---------------------------------------------------------------------------
@@ -369,6 +371,14 @@ pub trait Rule: Send + Sync {
     }
 
     /// Prose, examples and options for the rule's documentation page.
+    /// The cross-file part of this rule, if it has one. See
+    /// [`project::ProjectRule`]. Such rules usually return nothing from
+    /// [`Rule::check`] and report everything from the project step.
+    fn project(&self) -> Option<&dyn project::ProjectRule> {
+        None
+    }
+
+    /// Multi-line human-readable explanation with a bad/good code example.
     ///
     /// Everything else on the page (code, name, config table, fix
     /// availability and safety) is read from the other methods of this trait,
@@ -682,6 +692,7 @@ pub fn all_rules(
         Box::new(knq003::Knq003Rule::new()),
         Box::new(kpt::KptRule::new(config_dir.clone())),
         Box::new(kst::KstRule::new(config_dir)),
+        Box::new(kdu001::Kdu001Rule),
         // Must stay last: it audits the `# noqa` suppressions the rules
         // above recorded on the shared `FileContext`.
         Box::new(knq001::Knq001Rule::new()),

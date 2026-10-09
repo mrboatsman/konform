@@ -4,6 +4,10 @@
 
 konform enables the following rules by default (when no `select` is configured). See [Configuration](../configuration.md) to change that.
 
+## KDU (KDU)
+
+- [`duplicated-constants`](kdu001.md) (`KDU001`)
+
 ## KIB (KIB)
 
 - [`import-boundaries`](kib001.md) (`KIB001`)
