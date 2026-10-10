@@ -2,6 +2,7 @@
 
 ### Feat
 
+- **config**: add exclude and extend-exclude settings
 - **pre-commit**: add konform and konform-fix hooks
 - **action**: add a GitHub Action that runs konform check
 - **cli**: add completions subcommand for shell completion scripts
