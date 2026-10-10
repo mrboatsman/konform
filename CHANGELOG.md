@@ -31,6 +31,7 @@
 
 ### Fix
 
+- **noqa**: keep --add-noqa comments out of strings and continuations
 - **docs**: list each environment variable once
 - **rules**: warn on invalid KNQ settings
 - **output**: make the CI writers schema-correct and escape user data
