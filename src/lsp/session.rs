@@ -8,9 +8,10 @@ use crate::config::{load_config, Config};
 use crate::module_probe::ModuleProbe;
 use crate::rules::{all_rules, Rule};
 use crate::types::Violation;
+use globset::GlobSet;
 use lsp_types::{TextDocumentContentChangeEvent, Uri};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,9 @@ pub struct Session {
     /// recompiled) only when they change, not on every request.
     pub rules: Arc<Vec<Box<dyn Rule>>>,
     pub probe: Arc<ModuleProbe>,
+    /// `config`'s compiled `exclude` / `extend-exclude` globs; matching
+    /// documents get no diagnostics or fixes.
+    excluded: Option<GlobSet>,
     /// Working directory used for config discovery and relative path display.
     pub root: PathBuf,
 }
@@ -49,6 +53,7 @@ impl Session {
         let rules = Arc::new(all_rules(Arc::clone(&probe), config.config_dir.clone()));
         Self {
             documents: HashMap::new(),
+            excluded: config.exclude_set(),
             config: Arc::new(config),
             rules,
             probe,
@@ -110,6 +115,13 @@ impl Session {
         self.documents.get(uri).map(|d| d.source.as_str())
     }
 
+    /// `true` when the file behind `uri` matches the configured `exclude`.
+    pub fn is_excluded(&self, uri: &Uri) -> bool {
+        self.excluded
+            .as_ref()
+            .is_some_and(|gs| self.config.is_excluded(gs, Path::new(uri.path().as_str())))
+    }
+
     /// Store the most recently computed diagnostics for `codeAction` lookup.
     pub fn set_diagnostics(&mut self, uri: &Uri, diags: Vec<Violation>) {
         if let Some(doc) = self.documents.get_mut(uri) {
@@ -131,6 +143,7 @@ impl Session {
     /// Called when `workspace/didChangeWatchedFiles` fires.
     pub fn reload_config(&mut self) {
         self.config = Arc::new(load_config(Some(&self.root), None));
+        self.excluded = self.config.exclude_set();
         self.rules = Arc::new(all_rules(
             Arc::clone(&self.probe),
             self.config.config_dir.clone(),
