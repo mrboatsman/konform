@@ -31,6 +31,7 @@
 
 ### Fix
 
+- **config**: report broken config files and migrate extended ones
 - **cli**: drop the leftover "Run hatch fmt" message after --fix
 - **noqa**: keep --add-noqa comments out of strings and continuations
 - **docs**: list each environment variable once
