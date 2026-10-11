@@ -31,6 +31,7 @@
 
 ### Fix
 
+- **cli**: find the config above the current directory and for stdin
 - **config**: let exclude match parent directories like Ruff
 - **config**: report broken config files and migrate extended ones
 - **cli**: drop the leftover "Run hatch fmt" message after --fix
